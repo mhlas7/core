@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import logging
 import threading
 from typing import Any, override
+import uuid
 
 import aiohttp
 from amcrest import AmcrestError, ApiWrapper, LoginError
@@ -32,6 +33,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.dispatcher import async_dispatcher_send, dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .binary_sensor import BINARY_SENSOR_KEYS, BINARY_SENSORS, check_binary_sensors
@@ -71,6 +73,9 @@ NOTIFICATION_TITLE = "Amcrest Camera Setup"
 SCAN_INTERVAL = timedelta(seconds=10)
 
 AUTHENTICATION_LIST = {"basic": "basic"}
+
+STORAGE_KEY = "amcrest"
+STORAGE_VERSION = 1
 
 
 def _has_unique_names(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -361,6 +366,20 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Amcrest IP Camera component."""
     hass.data.setdefault(DATA_AMCREST, {DEVICES: {}})
 
+    store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+    stored_data: dict[str, Any] = await store.async_load() or {}
+    serial_numbers: dict[str, str] = stored_data.get("serial_numbers", {})
+    store_updated = False
+
+    # Names are unique per _has_unique_names, so they identify a stored camera.
+    configured_names = {device[CONF_NAME] for device in config[DOMAIN]}
+    for stale_name in serial_numbers.keys() - configured_names:
+        _LOGGER.debug(
+            "Removing stored ID for camera %s, no longer configured", stale_name
+        )
+        del serial_numbers[stale_name]
+        store_updated = True
+
     for device in config[DOMAIN]:
         name: str = device[CONF_NAME]
         username: str = device[CONF_USERNAME]
@@ -387,6 +406,29 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         else:
             authentication = None
 
+        serial_number = serial_numbers.get(name)
+        if serial_number is None:
+            try:
+                raw_sn = (await api.async_serial_number).strip()
+                if raw_sn:
+                    serial_number = raw_sn
+                else:
+                    _LOGGER.warning(
+                        "Camera %s returned an empty serial number, generating a stable ID",
+                        name,
+                    )
+                    serial_number = str(uuid.uuid4())
+            except AmcrestError:
+                _LOGGER.warning(
+                    "Could not reach %s camera during initial setup, "
+                    "generating a stable ID; the integration will recover "
+                    "when the camera comes online",
+                    name,
+                )
+                serial_number = str(uuid.uuid4())
+            serial_numbers[name] = serial_number
+            store_updated = True
+
         hass.data[DATA_AMCREST][DEVICES][name] = AmcrestDevice(
             api,
             authentication,
@@ -394,6 +436,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             stream_source,
             resolution,
             control_light,
+            serial_number=serial_number,
         )
 
         hass.async_create_task(
@@ -446,6 +489,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 )
             )
 
+    if store_updated:
+        await store.async_save({"serial_numbers": serial_numbers})
+
     if not hass.data[DATA_AMCREST][DEVICES]:
         return False
 
@@ -465,3 +511,4 @@ class AmcrestDevice:
     resolution: int
     control_light: bool
     channel: int = 0
+    serial_number: str | None = None
